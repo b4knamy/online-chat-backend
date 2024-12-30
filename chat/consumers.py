@@ -72,21 +72,17 @@ class ChatConsumer(AsyncWebsocketConsumer):
 
 class EnvironmentConsumer(AsyncWebsocketConsumer):
     async def connect(self) -> None:
-        self.room_context_name = "rooms_group"
-        self.users_context_name = "users_group"
+        self.environment_group = "environment_group"
         self.redis_users_key = "available_users"
         self.redis_online_key = "online_count"
 
-        await self.channel_layer.group_add(self.room_context_name, self.channel_name)
-        await self.channel_layer.group_add(self.users_context_name, self.channel_name)
+        await self.channel_layer.group_add(self.environment_group, self.channel_name)
         await self.accept()
 
         await self.show_available_users()
 
     async def disconnect(self, code) -> None:
-        await self.channel_layer.group_discard(self.room_context_name, self.channel_name)
-        await self.channel_layer.group_discard(self.users_context_name, self.channel_name)
-
+        await self.channel_layer.group_discard(self.environment_group, self.channel_name)
         await self.logout_user()
 
     async def receive(self, text_data) -> None:
@@ -109,7 +105,7 @@ class EnvironmentConsumer(AsyncWebsocketConsumer):
             }
 
             await self.channel_layer.group_send(
-                self.room_context_name, {
+                self.environment_group, {
                     "type": "room.created",
                     "data": {
                         "room": context
@@ -128,16 +124,18 @@ class EnvironmentConsumer(AsyncWebsocketConsumer):
         await new_room.asave()
         return new_room.id
 
-    async def show_available_users(self) -> None:
+    async def show_available_users(self, current_online_users: int | None = None) -> None:
         available_users = await self.get_available_users()
-        online_users = await self.get_online_users_count()
+
+        if not current_online_users:
+            current_online_users = await self.get_online_users_count()
 
         await self.channel_layer.group_send(
-            self.users_context_name, {
+            self.environment_group, {
                 "type": "available.users",
                 "data": {
                     "available_users": available_users,
-                    "online_users": online_users,
+                    "online_users": current_online_users,
                 },
             }
         )
@@ -154,18 +152,25 @@ class EnvironmentConsumer(AsyncWebsocketConsumer):
             await login(self.scope, user)
 
             online_users = await self.get_online_users_count()
-            redis_client.set(self.redis_online_key, online_users + 1)
+            updated_online_users = online_users + 1
+            redis_client.set(self.redis_online_key, updated_online_users)
 
-            await self.show_available_users()
+            await self.show_available_users(updated_online_users)
 
     async def logout_user(self) -> None:
         username = self.scope["user"].username
         redis_client.sadd(self.redis_users_key, username)
+
         await logout(self.scope)
+
         online_users = await self.get_online_users_count()
         if online_users > 0:
-            redis_client.set(self.redis_online_key, online_users - 1)
-        await self.show_available_users()
+            updated_online_users = online_users - 1
+            redis_client.set(self.redis_online_key, updated_online_users)
+            await self.show_available_users(updated_online_users)
+
+        else:
+            await self.show_available_users()
 
     async def get_available_users(self) -> list[str]:
         return [username.decode(

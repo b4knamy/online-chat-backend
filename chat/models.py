@@ -13,12 +13,6 @@ class Room(models.Model):
     name = models.CharField(max_length=10, unique=True)
     max_users = models.IntegerField(default=3)
 
-    def save(self, *args, **kwargs):
-        if self.admin and not self.admin.has_room:
-            self.admin.has_room = True
-            self.admin.save()
-        return super().save(*args, **kwargs)
-
     def __str__(self):
         return f"Room {self.name} owned by {self.admin.username}"
 

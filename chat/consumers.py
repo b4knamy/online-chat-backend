@@ -3,6 +3,7 @@ from urllib.parse import parse_qs
 from channels.generic.websocket import AsyncWebsocketConsumer
 from channels.auth import login, logout
 from django.db.utils import IntegrityError
+from re import match
 import redis.client
 from .models import Room, Messages, User
 import redis
@@ -72,6 +73,9 @@ class ChatConsumer(AsyncWebsocketConsumer):
 
 
 class EnvironmentConsumer(AsyncWebsocketConsumer):
+
+    # defaults
+
     async def connect(self) -> None:
         self.environment_group = "environment_group"
         self.redis_users_key = "available_users"
@@ -84,116 +88,85 @@ class EnvironmentConsumer(AsyncWebsocketConsumer):
 
     async def disconnect(self, code) -> None:
         await self.channel_layer.group_discard(self.environment_group, self.channel_name)
-        await self.logout_user()
+        await self.logout_user_handler()
 
     async def receive(self, text_data) -> None:
         body = json.loads(text_data)
+        print(body)
+        data = body.get("data", None)
+        handler = getattr(
+            self, f"{body["type"].replace(".", "_")}_handler", None)
 
-        match body["type"]:
-            case "login.user":
-                username = body["data"]["username"]
-                await self.login_user(username)
-            case "room.created":
-                if self.scope["user"].has_room:
-                    message = f"Usuário {
-                        self.scope["user"].username} já possui uma sala."
-                    await self.send_warning_message(message)
-                else:
-                    new_room = body["data"]["new_room"]
-                    new_room_id = await self.create_new_room(new_room)
-                    if not new_room_id:
-                        return
-                    context = {
-                        "admin": {
-                            "id": self.scope["user"].id,
-                            "username": self.scope["user"].username,
-                        },
-                        "id": new_room_id,
-                        "name": new_room,
-                        "room_messages": [],
-                    }
+        if handler:
+            await handler(data)
+        else:
+            await self.send_warning_message("Something goes wrong...")
 
-                    await self.channel_layer.group_send(
-                        self.environment_group, {
-                            "type": "room.created",
-                            "data": {
-                                "room": context
-                            },
-                        }
-                    )
-            case "logout.user":
-                await self.logout_user()
-
-    async def room_created(self, event):
+    async def event_handler(self, event) -> None:
         await self.send(text_data=json.dumps(event))
 
-    async def create_new_room(self, room_name: str) -> int:
-        if len(room_name) > 10:
-            message = "Nome da sala não pode ultrapassar 10 caracteres."
+    # related_handlers
+
+    async def room_created_handler(self, data: dict) -> None:
+        room_name = data["new_room"]
+
+        if self.scope["user"].has_room:
+            message = f"Usuário {
+                self.scope["user"].username} já possui uma sala."
+            await self.send_warning_message(message)
+            return
+        if not match(r"^[a-zA-Z0-9]{3,10}$", room_name):
+            message = "O nome da sala precisa conter entre 3 a 10 caracteres, apenas letras, numeros e sem espaços."
             await self.send_warning_message(message)
             return
         try:
-
             new_room: Room = await Room.objects.acreate(
                 admin=self.scope["user"],
                 name=room_name,
             )
             await new_room.asave()
-            return new_room.id
-
         except IntegrityError:
             message = f"Sala com o nome {room_name} já existe!"
             await self.send_warning_message(message)
 
-    async def show_available_users(self, current_online_users: int | None = None) -> None:
-        available_users = await self.get_available_users()
+        self.scope["user"].has_room = True
+        await self.scope["user"].asave()
 
-        if not current_online_users:
-            current_online_users = await self.get_online_users_count()
+        context = {
+            "admin": {
+                "id": self.scope["user"].id,
+                "username": self.scope["user"].username,
+            },
+            "id": new_room.id,
+            "name": new_room.name,
+            "room_messages": [],
+        }
+        await self.update_group_context("room.created", context)
 
-        await self.channel_layer.group_send(
-            self.environment_group, {
-                "type": "available.users",
-                "data": {
-                    "available_users": available_users,
-                    "online_users": current_online_users,
-                },
-            }
-        )
-
-    async def available_users(self, event) -> None:
-
-        await self.send(text_data=json.dumps(event))
-
-    async def login_user(self, username: str) -> None:
+    async def login_user_handler(self, data: dict) -> None:
+        username = data["username"]
         available_users = await self.get_available_users()
 
         if username in available_users:
-            redis_client.srem(self.redis_users_key, username)
             user = await User.objects.aget(username=username)
             await login(self.scope, user)
+            await self.update_available_users(username, remove=True)
 
-            online_users = await self.get_online_users_count()
-
-            updated_online_users = online_users + 1
-            redis_client.set(self.redis_online_key, updated_online_users)
-            print(f"\n{username} is now logged in.\n")
-            await self.show_available_users(updated_online_users)
-
-    async def logout_user(self) -> None:
-        username = self.scope["user"].username
-        redis_client.sadd(self.redis_users_key, username)
-
+    async def logout_user_handler(self, data: dict | None = None) -> None:
+        print(f"\n{self.scope["user"].username} is now logged out.\n")
         await logout(self.scope)
-        print(f"\n{username} is now logged out.\n")
-        online_users = await self.get_online_users_count()
-        if online_users > 0:
-            updated_online_users = online_users - 1
-            redis_client.set(self.redis_online_key, updated_online_users)
-            await self.show_available_users(updated_online_users)
+        await self.update_available_users(self.scope["user"].username)
 
-        else:
-            await self.show_available_users()
+    async def remove_room_handler(self, data: dict) -> None:
+        room = data["room"]
+        selected_room = await Room.objects.aget(name=room)
+        print("???2")
+        await selected_room.adelete()
+        print("???3")
+        await self.update_group_context("remove.room", {"room": room})
+        print("???4")
+
+    # helpers
 
     async def get_available_users(self) -> list[str]:
         return [username.decode(
@@ -201,6 +174,18 @@ class EnvironmentConsumer(AsyncWebsocketConsumer):
 
     async def get_online_users_count(self) -> int:
         return int(redis_client.get(self.redis_online_key))
+
+    async def show_available_users(self, online_users: int | None = None) -> None:
+        available_users = await self.get_available_users()
+
+        if not online_users:
+            online_users = await self.get_online_users_count()
+
+        data = {
+            "available_users": available_users,
+            "online_users": online_users,
+        }
+        await self.update_group_context("available.users", data)
 
     async def send_warning_message(self, message: str):
         context = {
@@ -210,3 +195,28 @@ class EnvironmentConsumer(AsyncWebsocketConsumer):
             }
         }
         await self.send(json.dumps(context))
+
+    async def update_group_context(self, event_type: str, data: dict) -> None:
+
+        await self.channel_layer.group_send(
+            self.environment_group, {
+                "type": "event.handler",
+                "event_type": event_type,
+                "context": data
+            }
+        )
+
+    async def update_available_users(self, username: str, remove=False) -> None:
+        online_users = await self.get_online_users_count()
+        if remove:
+            redis_client.srem(self.redis_users_key, username)
+            online_users += 1
+
+        else:
+            redis_client.sadd(self.redis_users_key, username)
+            if online_users <= 0:
+                return
+            online_users -= 1
+
+        redis_client.set(self.redis_online_key, online_users)
+        await self.show_available_users(online_users)

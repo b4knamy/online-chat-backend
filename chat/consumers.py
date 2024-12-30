@@ -1,9 +1,9 @@
 import json
+from urllib.parse import parse_qs
 from channels.generic.websocket import AsyncWebsocketConsumer
 from channels.auth import login, logout
 import redis.client
 from .models import Room, Messages, User
-from django.core.cache import cache
 import redis
 
 redis_client = redis.StrictRedis()
@@ -18,15 +18,16 @@ class ChatConsumer(AsyncWebsocketConsumer):
         self.room_name = self.scope["url_route"]["kwargs"]["room_name"]
         self.room_group_name = f"chat_{self.room_name}"
         self.last_message_date = ""
+        query_strings = parse_qs(self.scope["query_string"].decode("utf-8"))
+        username = query_strings.get("username", [""])[0]
 
         try:
             self.room_object = await Room.objects.aget(name=self.room_name)
-            self.current_user = await User.objects.aget(username="baknamy")
-        except Room.DoesNotExist:
+            self.current_user = await User.objects.aget(username=username)
+        except (Room.DoesNotExist, User.DoesNotExist):
             await self.close()
             return
 
-        # Join room group
         await self.channel_layer.group_add(self.room_group_name, self.channel_name)
         await self.accept()
 
@@ -49,14 +50,12 @@ class ChatConsumer(AsyncWebsocketConsumer):
             "created_at": self.last_message_date,
         }
 
-        # Send message to room group
         await self.channel_layer.group_send(
             self.room_group_name, {
                 "type": "chat.message", "data": {"message": context}}
         )
 
     async def chat_message(self, event):
-        # Send message to WebSocket
         await self.send(text_data=json.dumps(event))
 
     async def save_chat_context(self, text):
@@ -72,7 +71,7 @@ class ChatConsumer(AsyncWebsocketConsumer):
 
 
 class EnvironmentConsumer(AsyncWebsocketConsumer):
-    async def connect(self):
+    async def connect(self) -> None:
         self.room_context_name = "rooms_group"
         self.users_context_name = "users_group"
         self.redis_users_key = "available_users"
@@ -84,16 +83,15 @@ class EnvironmentConsumer(AsyncWebsocketConsumer):
 
         await self.show_available_users()
 
-    async def disconnect(self, code):
+    async def disconnect(self, code) -> None:
         await self.channel_layer.group_discard(self.room_context_name, self.channel_name)
         await self.channel_layer.group_discard(self.users_context_name, self.channel_name)
 
         await self.logout_user()
 
-    async def receive(self, text_data):
+    async def receive(self, text_data) -> None:
         body = json.loads(text_data)
         event_type = body["type"]
-        print(body)
         if event_type == "login.user":
             username = body["data"]["username"]
             await self.login_user(username)
@@ -120,9 +118,7 @@ class EnvironmentConsumer(AsyncWebsocketConsumer):
             )
 
     async def room_created(self, event):
-        await self.send(
-            text_data=json.dumps(event)
-        )
+        await self.send(text_data=json.dumps(event))
 
     async def create_new_room(self, room_name: str) -> int:
         new_room: Room = await Room.objects.acreate(
@@ -135,8 +131,6 @@ class EnvironmentConsumer(AsyncWebsocketConsumer):
     async def show_available_users(self) -> None:
         available_users = await self.get_available_users()
         online_users = await self.get_online_users_count()
-        print(online_users)
-        print(f"\n\n{available_users}\n\n")
 
         await self.channel_layer.group_send(
             self.users_context_name, {
@@ -148,7 +142,7 @@ class EnvironmentConsumer(AsyncWebsocketConsumer):
             }
         )
 
-    async def available_users(self, event):
+    async def available_users(self, event) -> None:
 
         await self.send(text_data=json.dumps(event))
 
@@ -164,25 +158,18 @@ class EnvironmentConsumer(AsyncWebsocketConsumer):
 
             await self.show_available_users()
 
-            print(f"\n User {username} is logged in now! \n")
-        else:
-            print("\n\nuser selected is not available!\n\n")
-
-    async def logout_user(self):
+    async def logout_user(self) -> None:
         username = self.scope["user"].username
-        print(self.scope["user"])
         redis_client.sadd(self.redis_users_key, username)
-        print(f"username: {username} was added")
         await logout(self.scope)
         online_users = await self.get_online_users_count()
         if online_users > 0:
             redis_client.set(self.redis_online_key, online_users - 1)
         await self.show_available_users()
-        print(f"\n User {username} is logged out now! \n")
 
-    async def get_available_users(self):
+    async def get_available_users(self) -> list[str]:
         return [username.decode(
             "utf-8") for username in redis_client.smembers(self.redis_users_key)]
 
-    async def get_online_users_count(self):
+    async def get_online_users_count(self) -> int:
         return int(redis_client.get(self.redis_online_key))

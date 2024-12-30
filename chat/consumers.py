@@ -92,26 +92,35 @@ class EnvironmentConsumer(AsyncWebsocketConsumer):
             username = body["data"]["username"]
             await self.login_user(username)
         else:
-            new_room = body["data"]["new_room"]
-            new_room_id = await self.create_new_room(new_room)
-            context = {
-                "admin": {
-                    "id": self.current_user.id,
-                    "username": self.current_user.username,
-                },
-                "id": new_room_id,
-                "name": new_room,
-                "room_messages": [],
-            }
-
-            await self.channel_layer.group_send(
-                self.environment_group, {
-                    "type": "room.created",
+            if self.scope["user"].has_room:
+                context = {
+                    "type": "room.failed",
                     "data": {
-                        "room": context
-                    },
+                            "message": f"Usuário {self.scope["user"].username} já possui uma sala."
+                    }
                 }
-            )
+                await self.send(json.dumps(context))
+            else:
+                new_room = body["data"]["new_room"]
+                new_room_id = await self.create_new_room(new_room)
+                context = {
+                    "admin": {
+                        "id": self.current_user.id,
+                        "username": self.current_user.username,
+                    },
+                    "id": new_room_id,
+                    "name": new_room,
+                    "room_messages": [],
+                }
+
+                await self.channel_layer.group_send(
+                    self.environment_group, {
+                        "type": "room.created",
+                        "data": {
+                            "room": context
+                        },
+                    }
+                )
 
     async def room_created(self, event):
         await self.send(text_data=json.dumps(event))

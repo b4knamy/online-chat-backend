@@ -9,8 +9,10 @@ from .models import Room, Messages, User
 import redis
 
 redis_client = redis.StrictRedis()
-
-usernames = [user.username for user in User.objects.all()]
+usernames = [
+    user.username for user in User.objects.filter(is_superuser=False)]
+# usernames = [
+#     user.username for user in User.objects.all()]
 redis_client.sadd("available_users", *usernames)
 redis_client.set("online_count", 0)
 
@@ -108,13 +110,13 @@ class EnvironmentConsumer(AsyncWebsocketConsumer):
     # related_handlers
 
     async def room_created_handler(self, data: dict) -> None:
-        room_name = data["new_room"]
-
         if self.scope["user"].has_room:
             message = f"Usuário {
                 self.scope["user"].username} já possui uma sala."
             await self.send_warning_message(message)
             return
+        room_name = data["new_room"]
+
         if not match(r"^[a-zA-Z0-9]{3,10}$", room_name):
             message = "O nome da sala precisa conter entre 3 a 10 caracteres, apenas letras, numeros e sem espaços."
             await self.send_warning_message(message)
@@ -131,7 +133,6 @@ class EnvironmentConsumer(AsyncWebsocketConsumer):
 
         self.scope["user"].has_room = True
         await self.scope["user"].asave()
-
         context = {
             "admin": {
                 "id": self.scope["user"].id,
@@ -142,6 +143,7 @@ class EnvironmentConsumer(AsyncWebsocketConsumer):
             "room_messages": [],
         }
         await self.update_group_context("room.created", context)
+        await self.send_notification(f'Usuário {self.scope["user"].username} acabou de criar a sala {room_name}!')
 
     async def login_user_handler(self, data: dict) -> None:
         username = data["username"]
@@ -151,20 +153,22 @@ class EnvironmentConsumer(AsyncWebsocketConsumer):
             user = await User.objects.aget(username=username)
             await login(self.scope, user)
             await self.update_available_users(username, remove=True)
+            await self.send_notification(f'Usuário {self.scope["user"].username} entrou!')
 
     async def logout_user_handler(self, data: dict | None = None) -> None:
         print(f"\n{self.scope["user"].username} is now logged out.\n")
         await logout(self.scope)
         await self.update_available_users(self.scope["user"].username)
+        await self.send_notification(f'Usuário {self.scope["user"].username} saiu!')
 
     async def remove_room_handler(self, data: dict) -> None:
         room = data["room"]
         selected_room = await Room.objects.aget(name=room)
-        print("???2")
         await selected_room.adelete()
-        print("???3")
+        self.scope["user"].has_room = False
+        await self.scope["user"].asave()
         await self.update_group_context("remove.room", {"room": room})
-        print("???4")
+        await self.send_notification(f'Usuário {self.scope["user"].username} deletou a sala {room}!')
 
     # helpers
 
@@ -189,11 +193,12 @@ class EnvironmentConsumer(AsyncWebsocketConsumer):
 
     async def send_warning_message(self, message: str):
         context = {
-            "type": "room.failed",
-            "data": {
+            "event_type": "room.failed",
+            "context": {
                 "message": message
             }
         }
+        print(context)
         await self.send(json.dumps(context))
 
     async def update_group_context(self, event_type: str, data: dict) -> None:
@@ -220,3 +225,9 @@ class EnvironmentConsumer(AsyncWebsocketConsumer):
 
         redis_client.set(self.redis_online_key, online_users)
         await self.show_available_users(online_users)
+
+    async def send_notification(self, message: str) -> None:
+        context = {
+            "message": message
+        }
+        await self.update_group_context("notify.user", context)
